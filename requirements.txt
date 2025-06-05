@@ -13,3 +13,5 @@ imageio
 imageio-ffmpeg
 opencv-python
 qwen-vl-utils[decord]
+pytorch_wavelets @ git+https://github.com/fbcotter/pytorch_wavelets
+PyWavelets

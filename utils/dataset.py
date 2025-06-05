@@ -20,6 +20,7 @@ from safetensors.torch import load_file
 
 import decord
 decord.bridge.set_bridge('torch')
+Image.MAX_IMAGE_PIXELS = None
 
 
 IMAGE_TYPES = [".jpg", ".jpeg", ".png"]
@@ -37,6 +38,13 @@ BUCKET_RESOLUTIONS_960 = {
     "16x9": (1280, 720),
     "4x3":  (1088, 832),
     "1x1":  (960,  960),
+}
+
+
+BUCKET_RESOLUTIONS_1024 = {
+    "16x9": (1344, 768),
+    "4x3":  (1184, 896),
+    "1x1":  (1024,  1024),
 }
 
 
@@ -77,7 +85,9 @@ class CombinedDataset(Dataset):
         self.load_control = load_control
         self.control_suffix = control_suffix
         
-        if bucket_resolution == 960:
+        if bucket_resolution == 1024:
+            self.bucket_resolution = BUCKET_RESOLUTIONS_1024
+        elif bucket_resolution == 960:
             self.bucket_resolution = BUCKET_RESOLUTIONS_960
         else:
             self.bucket_resolution = BUCKET_RESOLUTIONS_624

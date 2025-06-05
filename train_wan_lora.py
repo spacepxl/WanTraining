@@ -37,6 +37,7 @@ from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
 from utils.temp_rng import temp_rng
 from utils.dataset import CombinedDataset
+from utils.dwt_loss import dwt_loss
 
 
 def make_dir(base, folder):
@@ -386,7 +387,8 @@ def main(args):
             blur = v2.Compose([
                 v2.Resize(size=(height // 4, width // 4)),
                 v2.Resize(size=(height, width)),
-                v2.GaussianBlur(kernel_size=15, sigma=random.uniform(3, 6)),
+                # v2.GaussianBlur(kernel_size=15, sigma=random.uniform(3, 6)),
+                v2.GaussianBlur(kernel_size=15, sigma=3),
             ])
             
             control = torch.clamp(torch.nan_to_num(blur(control)), min=-1, max=1)
@@ -437,7 +439,11 @@ def main(args):
         target = []
         noisy_model_input = []
         for i in range(len(latents)):
-            target.append(noise[i] - latents[i])
+            if args.use_dwt_loss:
+                target.append(latents[i])
+            else:
+                target.append(noise[i] - latents[i])
+            
             noisy = noise[i] * sigmas[i] + latents[i] * (1 - sigmas[i])
             
             if args.control_lora:
@@ -446,6 +452,7 @@ def main(args):
             noisy_model_input.append(noisy.to(torch.bfloat16))
         
         return {
+            "sigmas": sigmas,
             "target": target,
             "context": context,
             "timesteps": timesteps,
@@ -454,12 +461,14 @@ def main(args):
     
     def predict_loss(conditions, log_cfg_loss=False):
         target = torch.stack(conditions["target"])
-        c, f, h, w = conditions["noisy_model_input"][0].shape
+        sigmas = conditions["sigmas"]
+        noisy_model_input = conditions["noisy_model_input"]
+        c, f, h, w = noisy_model_input[0].shape
         seq_len = math.ceil((h / 2) * (w / 2) * f)
         
         pred = torch.stack(
             diffusion_model(
-                x = conditions["noisy_model_input"],
+                x = noisy_model_input,
                 t = conditions["timesteps"],
                 context = conditions["context"],
                 seq_len = seq_len,
@@ -472,7 +481,7 @@ def main(args):
                 
                 base_pred_cond = torch.stack(
                     diffusion_model(
-                        x = conditions["noisy_model_input"],
+                        x = noisy_model_input,
                         t = conditions["timesteps"],
                         context = conditions["context"],
                         seq_len = seq_len,
@@ -481,9 +490,9 @@ def main(args):
                 
                 base_pred_uncond = torch.stack(
                     diffusion_model(
-                        x = conditions["noisy_model_input"],
+                        x = noisy_model_input,
                         t = conditions["timesteps"],
-                        context = [context_negative] * len(conditions["noisy_model_input"]),
+                        context = [context_negative] * len(noisy_model_input),
                         seq_len = seq_len,
                     )
                 )
@@ -497,6 +506,15 @@ def main(args):
                 target += args.distill_cfg * (base_pred_cond - base_pred_uncond)
         
         assert not torch.isnan(pred).any()
+        
+        if args.use_dwt_loss:
+            # need to get clean prediction instead of velocity
+            pred = torch.stack([p * (-sigmas[i]) + noisy_model_input[i] for i, p in enumerate(pred)])
+            
+            pred = torch.cat([p.movedim(1, 0) for p in pred.float()], dim=0) # (B)CFHW -> FCHW
+            target = torch.cat([t.movedim(1, 0) for t in target.float()], dim=0)
+            return dwt_loss(pred, target)
+        
         return F.mse_loss(pred.float(), target.float())
     
     gc.collect()
@@ -700,6 +718,11 @@ def parse_args():
         help = "Noise schedule shift for training (shift > 1 will spend more effort on early timesteps/high noise",
     )
     parser.add_argument(
+        "--use_dwt_loss",
+        action = "store_true",
+        help = "Use discrete wavelet transform loss from https://arxiv.org/abs/2503.18352",
+    )
+    parser.add_argument(
         "--distill_cfg",
         type = float,
         default = 0.0,
@@ -715,7 +738,7 @@ def parse_args():
         "--base_res",
         type = int,
         default = 624,
-        choices=[624, 960],
+        choices=[624, 960, 1024],
         help = "Base resolution bucket, resized to equal area based on aspect ratio",
     )
     parser.add_argument(
