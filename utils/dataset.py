@@ -48,6 +48,13 @@ BUCKET_RESOLUTIONS_1024 = {
 }
 
 
+BUCKETS = {
+    624: BUCKET_RESOLUTIONS_624,
+    960: BUCKET_RESOLUTIONS_960,
+    1024: BUCKET_RESOLUTIONS_1024,
+}
+
+
 def get_resolution(width, height, buckets):
     ar = width / height
     if ar > 1.528:
@@ -64,8 +71,11 @@ def get_resolution(width, height, buckets):
     return new_width, new_height
 
 
-def count_tokens(width, height, frames):
-    return (width // 16) * (height // 16) * ((frames - 1) // 4 + 1)
+def count_tokens(width, height, frames, patch_size=(1, 2, 2), vae_stride=(4, 8, 8)):
+    tf = (frames - 1) // (patch_size[0] * vae_stride[0]) + 1
+    th = height // (patch_size[1] * vae_stride[1])
+    tw = width // (patch_size[2] * vae_stride[2])
+    return tf * th * tw
 
 
 class CombinedDataset(Dataset):
@@ -74,30 +84,28 @@ class CombinedDataset(Dataset):
         root_folder,
         token_limit = 10_000,
         limit_samples = None,
-        max_frame_stride = 4,
-        bucket_resolution = 624,
+        max_frame_stride = 2,
+        random_frame_length = False,
+        bucket_resolutions = [624,],
         load_control = False,
-        control_suffix = "",
+        control_suffix = "_control",
     ):
         self.root_folder = root_folder
         self.token_limit = token_limit
         self.max_frame_stride = max_frame_stride
         self.load_control = load_control
         self.control_suffix = control_suffix
-        
-        if bucket_resolution == 1024:
-            self.bucket_resolution = BUCKET_RESOLUTIONS_1024
-        elif bucket_resolution == 960:
-            self.bucket_resolution = BUCKET_RESOLUTIONS_960
-        else:
-            self.bucket_resolution = BUCKET_RESOLUTIONS_624
+        self.bucket_resolutions = bucket_resolutions
+        self.random_frame_length = random_frame_length
         
         # search for all files matching image or video extensions
         self.media_files = []
         for ext in IMAGE_TYPES + VIDEO_TYPES:
-            self.media_files.extend(
-                glob(os.path.join(self.root_folder, "**", "*" + ext), recursive=True)
-            )
+            all_ext_files = glob(os.path.join(self.root_folder, "**", "*" + ext), recursive=True)
+            for file in all_ext_files:
+                name = os.path.splitext(os.path.basename(file))[0]
+                if not name.endswith(self.control_suffix):
+                    self.media_files.append(file)
         
         # pull samples evenly from the whole dataset
         if limit_samples is not None:
@@ -122,17 +130,30 @@ class CombinedDataset(Dataset):
     
     def __getitem__(self, idx):
         ext = os.path.splitext(self.media_files[idx])[1].lower()
+        bucket = BUCKETS[random.choice(self.bucket_resolutions)]
+        
         if ext in IMAGE_TYPES:
             image = Image.open(self.media_files[idx]).convert('RGB')
             pixels = torch.as_tensor(np.array(image)).unsqueeze(0) # FHWC
-            width, height = get_resolution(pixels.shape[2], pixels.shape[1], self.bucket_resolution)
+            width, height = get_resolution(pixels.shape[2], pixels.shape[1], bucket)
+            
+            if self.load_control:
+                control_file = self.media_files[idx].replace(ext, self.control_suffix + ext)
+                control_image = Image.open(control_file).convert('RGB')
+                control_pixels = torch.as_tensor(np.array(control_image)).unsqueeze(0) # FHWC
+                pixels = torch.cat([pixels, control_pixels], dim=-1)
+        
         else:
             vr = decord.VideoReader(self.media_files[idx])
             orig_height, orig_width = vr[0].shape[:2]
             orig_frames = len(vr)
             
-            width, height = get_resolution(orig_width, orig_height, self.bucket_resolution)
+            width, height = get_resolution(orig_width, orig_height, bucket)
             max_frames = self.find_max_frames(width, height)
+            
+            if self.random_frame_length:
+                max_frames = random.randint(0, (max_frames - 1) // 4) * 4 + 1
+            
             stride = max(min(random.randint(1, self.max_frame_stride), orig_frames // max_frames), 1)
             
             # sample a clip from the video based on frame stride and length
@@ -141,6 +162,13 @@ class CombinedDataset(Dataset):
             pixels = vr[start_frame : start_frame+seg_len : stride]
             max_frames = ((pixels.shape[0] - 1) // 4) * 4 + 1
             pixels = pixels[:max_frames] # clip frames to match vae
+            
+            if self.load_control:
+                control_file = self.media_files[idx].replace(ext, self.control_suffix + ext)
+                control_vr = decord.VideoReader(control_file)
+                control_pixels = control_vr[start_frame : start_frame+seg_len : stride]
+                control_pixels = control_pixels[:max_frames]
+                pixels = torch.cat([pixels, control_pixels], dim=-1)
         
         # determine crop dimensions to prevent stretching during resize
         pixels_ar = pixels.shape[2] / pixels.shape[1]
@@ -167,7 +195,8 @@ class CombinedDataset(Dataset):
         pixels = torch.clamp(torch.nan_to_num(pixels), min=-1, max=1)
         
         if self.load_control:
-            raise NotImplementedError("loading control files from disk is not implemented yet")
+            control = pixels[:, :, 3:]
+            pixels = pixels[:, :, :3]
         else:
             control = None
         

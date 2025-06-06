@@ -55,6 +55,22 @@ def load_timer(target):
     print(f"loaded {target} in {end_time - start_time:0.2f} seconds")
 
 
+def convert_sd(sd):
+    converted_sd = {}
+    for key in sd.keys():
+        renamed_key = key
+        
+        if ".reshape_weight" in key:
+            continue
+        
+        if "diffusion_model." in renamed_key:
+            renamed_key = renamed_key.replace("diffusion_model.", "")
+        
+        converted_sd[renamed_key] = sd[key].to(torch.float32)
+    
+    return converted_sd
+
+
 def download_model(args):
     from huggingface_hub import snapshot_download
     
@@ -187,7 +203,8 @@ def main(args):
             root_folder = train_dataset,
             token_limit = args.token_limit,
             max_frame_stride = args.max_frame_stride,
-            bucket_resolution = args.base_res,
+            random_frame_length = args.random_frame_length,
+            bucket_resolutions = args.base_res,
             load_control = args.load_control,
             control_suffix = args.control_suffix,
         )
@@ -197,7 +214,8 @@ def main(args):
             token_limit = args.token_limit,
             limit_samples = args.val_samples,
             max_frame_stride = args.max_frame_stride,
-            bucket_resolution = args.base_res,
+            random_frame_length = args.random_frame_length,
+            bucket_resolutions = args.base_res,
             load_control = args.load_control,
             control_suffix = args.control_suffix,
         )
@@ -276,9 +294,11 @@ def main(args):
     
     if args.fuse_lora is not None:
         loaded_lora_sd = load_file(args.fuse_lora)
+        loaded_lora_sd = convert_sd(loaded_lora_sd)
         diffusion_model.load_lora_adapter(loaded_lora_sd, adapter_name="fuse_lora")
         diffusion_model.fuse_lora(adapter_names="fuse_lora", lora_scale=args.fuse_lora_weight, safe_fusing=True)
         diffusion_model.unload_lora_weights()
+        del loaded_lora_sd
     
     lora_params = []
     if args.control_lora:
@@ -317,6 +337,7 @@ def main(args):
     
     if args.init_lora is not None:
         loaded_lora_sd = load_file(args.init_lora)
+        loaded_lora_sd = convert_sd(loaded_lora_sd)
         outcome = set_peft_model_state_dict(diffusion_model, loaded_lora_sd)
         if len(outcome.unexpected_keys) > 0:
             for key in outcome.unexpected_keys:
@@ -324,6 +345,7 @@ def main(args):
             exit()
         else:
             print("init lora loaded successfully, all keys matched")
+        del loaded_lora_sd
     
     
     total_parameters = 0
@@ -410,7 +432,7 @@ def main(args):
         
         return control
     
-    def prepare_conditions(batch):
+    def prepare_conditions(batch, timestep=None):
         pixels, context, control = batch
         
         pixels  = [p.to(dtype=torch.bfloat16, device=device) for p in pixels]
@@ -419,10 +441,14 @@ def main(args):
         latents = vae.encode(pixels)
         noise = [torch.randn_like(l) for l in latents]
         
-        sigmas = torch.rand(len(latents)).to(device)
-        sigmas = (args.shift * sigmas) / (1 + (args.shift - 1) * sigmas)
-        timesteps = torch.round(sigmas * 1000).long()
-        sigmas = timesteps.float() / 1000
+        if timestep is not None:
+            timesteps = torch.ones(len(latents)).to(device) * timestep
+            sigmas = timesteps.float() / 1000
+        else:
+            sigmas = torch.rand(len(latents)).to(device)
+            sigmas = (args.shift * sigmas) / (1 + (args.shift - 1) * sigmas)
+            timesteps = torch.round(sigmas * 1000).long()
+            sigmas = timesteps.float() / 1000
         
         if args.control_lora:
             if control is not None:
@@ -535,6 +561,9 @@ def main(args):
             # optimizer.step()
             # optimizer.zero_grad()
             
+            gc.collect()
+            torch.cuda.empty_cache()
+            
             t_writer.add_scalar("debug/step_time", perf_counter() - start_step, global_step)
             progress_bar.update(1)
             global_step += 1
@@ -543,10 +572,13 @@ def main(args):
                 with torch.inference_mode(), temp_rng(args.val_seed or args.seed):
                     val_loss = 0.0
                     for step, batch in enumerate(tqdm(val_dataloader, desc="validation", leave=False)):
-                        conditions = prepare_conditions(batch)
+                        conditions = prepare_conditions(batch, timestep=args.val_timestep)
                         loss = predict_loss(conditions)
                         val_loss += loss.detach().item()
                     t_writer.add_scalar("loss/validation", val_loss / len(val_dataloader), global_step)
+                
+                gc.collect()
+                torch.cuda.empty_cache()
                 progress_bar.unpause()
             
             if global_step >= args.max_train_steps or global_step % args.checkpointing_steps == 0:
@@ -554,6 +586,8 @@ def main(args):
                     get_peft_model_state_dict(diffusion_model),
                     os.path.join(checkpoint_dir, f"wan-lora-{global_step:08}.safetensors"),
                 )
+                gc.collect()
+                torch.cuda.empty_cache()
             
             if global_step >= args.max_train_steps:
                 break
@@ -655,20 +689,20 @@ def parse_args():
     parser.add_argument(
         "--load_control",
         action = "store_true",
-        help = "load control files from disk instead of calculating on the fly",
+        help = "Load control files from disk instead of calculating on the fly. Bypasses --control_preprocess",
     )
     parser.add_argument(
         "--control_suffix",
         type = str,
         default = "_control",
-        help = "suffix to append to video file name (ignoring extension) to get the control video",
+        help = "suffix to append to media file name (ignoring extension) to get the control file",
     )
     parser.add_argument(
         "--control_preprocess",
         type = str,
-        default = "tile",
-        choices=["tile", "depth"],
-        help = "Preprocess to apply if not loading a control video",
+        default = "none",
+        choices=["none", "tile", "depth"],
+        help = "Preprocess to apply if not loading a control video. Ignored if using --load_control",
     )
     parser.add_argument(
         "--control_inject_noise",
@@ -737,9 +771,10 @@ def parse_args():
     parser.add_argument(
         "--base_res",
         type = int,
+        nargs = '+',
         default = 624,
         choices=[624, 960, 1024],
-        help = "Base resolution bucket, resized to equal area based on aspect ratio",
+        help = "Base resolution buckets, resized to equal area based on aspect ratio. Supports multiple buckets.",
     )
     parser.add_argument(
         "--token_limit",
@@ -754,10 +789,21 @@ def parse_args():
         help = "1: use native framerate only. Higher values allow randomly choosing lower framerates (skipping frames to speed up the video)",
     )
     parser.add_argument(
+        "--random_frame_length",
+        action = "store_true",
+        help = "Randomize frame length instead of always trying to fill the max length",
+    )
+    parser.add_argument(
         "--val_steps",
         type = int,
         default = 100,
         help = "Validate after every n steps",
+    )
+    parser.add_argument(
+        "--val_timestep",
+        type = int,
+        default = None,
+        help = "Override timestep for validation samples",
     )
     parser.add_argument(
         "--checkpointing_steps",
