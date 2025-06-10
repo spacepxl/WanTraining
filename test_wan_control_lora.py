@@ -27,6 +27,22 @@ import decord
 decord.bridge.set_bridge('torch')
 
 
+def convert_sd(sd):
+    converted_sd = {}
+    for key in sd.keys():
+        renamed_key = key
+        
+        if ".reshape_weight" in key:
+            continue
+        
+        if "diffusion_model." in renamed_key:
+            renamed_key = renamed_key.replace("diffusion_model.", "")
+        
+        converted_sd[renamed_key] = sd[key].to(torch.float32)
+    
+    return converted_sd
+
+
 @torch.inference_mode()
 def main(args):
     date_time = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -61,6 +77,7 @@ def main(args):
     diffusion_model = WanModel.from_pretrained("./models/" + args.pretrained_model_name_or_path, torch_dtype=torch.bfloat16).to(device)
     
     lora_sd = load_file(args.lora)
+    lora_sd = convert_sd(lora_sd)
     
     if "patch_embedding.lora_A.weight" in lora_sd:
         in_cls = diffusion_model.patch_embedding.__class__ # nn.Conv3d
