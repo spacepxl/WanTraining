@@ -455,6 +455,12 @@ def main(args):
                 control = [p.to(dtype=torch.bfloat16, device=device) for p in control]
             else:
                 control = [preprocess_control(p) for p in pixels]
+            
+            if args.control_i2v:
+                for i, p in enumerate(pixels):
+                    if p.shape[1] > 1:
+                        control[i][:, 0] = p[:, 0]
+            
             control_latents = vae.encode(control)
             
             if args.control_inject_noise > 0:
@@ -554,6 +560,9 @@ def main(args):
             start_step = perf_counter()
             with torch.inference_mode():
                 conditions = prepare_conditions(batch)
+            
+            gc.collect()
+            torch.cuda.empty_cache()
             
             loss = predict_loss(conditions, log_cfg_loss=True)
             t_writer.add_scalar("loss/train", loss.detach().item(), global_step)
@@ -685,6 +694,11 @@ def parse_args():
         "--control_lora",
         action = "store_true",
         help = "Train lora as control lora (extra input channels)",
+    )
+    parser.add_argument(
+        "--control_i2v",
+        action = "store_true",
+        help = "Train control lora as i2v instead of t2v, replacing first control frame with image",
     )
     parser.add_argument(
         "--load_control",
